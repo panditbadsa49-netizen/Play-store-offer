@@ -1,6 +1,5 @@
-python-telegram-bot[job-queue]==21.5
-beautifulsoup4==4.12.3
-requests==2.32.3
-firebase-admin==6.5.0
-flask==3.0.3
-gunicorn==22.0.0
+python-telegram-bot
+firebase-admin
+httpx
+beautifulsoup4
+python-dotenv
