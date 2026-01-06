@@ -33,109 +33,103 @@ if not firebase_admin._apps:
     except Exception as e:
         logger.error(f"❌ ফায়ারবেস কানেকশন এরর: {e}")
 
-# --- উন্নত স্ক্র্যাপিং ফাংশন ---
-async def fetch_deals():
-    deals = []
-    base_url = "https://www.androidpolice.com/tag/google-play-store-deals/"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-    }
+# --- নতুন স্ক্র্যাপিং লজিক (Multiple Sources) ---
+async def fetch_all_deals():
+    all_deals = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    async with httpx.AsyncClient(headers=headers, timeout=20.0) as client:
+    async with httpx.AsyncClient(headers=headers, timeout=25.0, follow_redirects=True) as client:
+        # সোর্স ১: Android Police
         try:
-            response = await client.get(base_url)
-            if response.status_code != 200: return []
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # Android Police এর নতুন লেআউট অনুযায়ী সিলেক্টর আপডেট করা হয়েছে
-            articles = soup.find_all('div', class_='display-card') or soup.find_all('h2', limit=10)
+            ap_res = await client.get("https://www.androidpolice.com/tag/google-play-store-deals/")
+            if ap_res.status_code == 200:
+                soup = BeautifulSoup(ap_res.text, 'html.parser')
+                for item in soup.find_all(['h2', 'div'], class_=re.compile(r'display-card|title')):
+                    a_tag = item.find('a') if item.name == 'div' else item.find('a')
+                    if a_tag and any(kw in a_tag.text.lower() for kw in ["free", "sale", "deal", "discount"]):
+                        title = a_tag.text.strip()
+                        url = "https://www.androidpolice.com" + a_tag['href'] if not a_tag['href'].startswith('http') else a_tag['href']
+                        all_deals.append({"title": title, "link": url, "source": "Android Police"})
+        except Exception as e: logger.error(f"AP Error: {e}")
 
-            for article in articles:
-                link_tag = article.find('a')
-                if not link_tag: continue
-                
-                title = link_tag.text.strip()
-                article_url = "https://www.androidpolice.com" + link_tag['href'] if not link_tag['href'].startswith('http') else link_tag['href']
+        # সোর্স ২: OzBargain (খুবই পাওয়ারফুল অফার সোর্স)
+        try:
+            oz_res = await client.get("https://www.ozbargain.com.au/search/node/google%20play%20store%20free")
+            if oz_res.status_code == 200:
+                soup = BeautifulSoup(oz_res.text, 'html.parser')
+                for node in soup.find_all('h2', class_='title'):
+                    oz_a = node.find('a')
+                    if oz_a:
+                        all_deals.append({
+                            "title": oz_a.text.strip(),
+                            "link": "https://www.ozbargain.com.au" + oz_a['href'],
+                            "source": "OzBargain"
+                        })
+        except Exception as e: logger.error(f"Oz Error: {e}")
 
-                # কিওয়ার্ড চেক
-                if any(kw in title.lower() for kw in ["free", "sale", "discount", "deal", "apps temporarily free"]):
-                    # আর্টিকেলের ভেতর থেকে আসল প্লে-স্টোর লিঙ্ক বের করার চেষ্টা (Advanced)
-                    play_store_url = await extract_play_link(client, article_url)
-                    deals.append({
-                        "title": title,
-                        "article_link": article_url,
-                        "play_link": play_store_url or article_url
-                    })
-        except Exception as e:
-            logger.error(f"⚠️ স্ক্র্যাপিং এরর: {e}")
-    return deals
+    return all_deals
 
-async def extract_play_link(client, url):
-    """আর্টিকেলের ভেতর থেকে গুগল প্লে স্টোর লিঙ্ক খুঁজে বের করে"""
-    try:
-        res = await client.get(url)
-        # Regex ব্যবহার করে প্লে স্টোর লিঙ্ক খোঁজা
-        match = re.search(r'https://play\.google\.com/store/apps/details\?id=[a-zA-Z0-9._]+', res.text)
-        return match.group(0) if match else None
-    except:
-        return None
-
-# --- অটোমেটেড জব (Background Task) ---
+# --- অটোমেটেড জব ---
 async def auto_check_deals(context: ContextTypes.DEFAULT_TYPE):
     ref = db.reference('/sent_deals')
-    new_deals = await fetch_deals()
+    deals = await fetch_all_deals()
     
-    for deal in new_deals:
-        # ইউনিক কি তৈরি (টাইটেল থেকে আলফানিউমেরিক অংশ নিয়ে)
+    if not deals:
+        logger.info("ℹ️ কোনো অফার পাওয়া যায়নি।")
+        return
+
+    new_found_count = 0
+    for deal in deals:
+        # টাইটেল থেকে ক্লিন আইডি তৈরি
         deal_id = re.sub(r'\W+', '', deal['title'])[:60]
         
         if not ref.child(deal_id).get():
-            keyboard = [
-                [InlineKeyboardButton("🚀 সরাসরি ডাউনলোড", url=deal['play_link'])],
-                [InlineKeyboardButton("📖 বিস্তারিত পড়ুন", url=deal['article_link'])]
-            ]
+            new_found_count += 1
+            keyboard = [[InlineKeyboardButton("🎁 অফারটি দেখুন", url=deal['link'])]]
             
             message = (
-                f"🔥 **নতুন প্রিমিয়াম অ্যাপ অফার!**\n\n"
-                f"📝 **নাম:** `{deal['title']}`\n\n"
-                f"📌 এটি এখন সীমিত সময়ের জন্য ফ্রি বা ডিসকাউন্টে পাওয়া যাচ্ছে। দ্রুত সংগ্রহ করুন!"
+                f"🔥 **নতুন অফার পাওয়া গেছে!** ({deal['source']})\n\n"
+                f"📱 **নাম:** `{deal['title']}`\n\n"
+                f"✅ দ্রুত চেক করুন, অফারটি সীমিত সময়ের জন্য!"
             )
             
             try:
                 await context.bot.send_message(
                     chat_id=CHAT_ID,
                     text=message,
-                    reply_markup=InlineKeyboardMarkup(keyboard),
-                    disable_web_page_preview=False
+                    reply_markup=InlineKeyboardMarkup(keyboard)
                 )
-                ref.child(deal_id).set({"title": deal['title'], "timestamp": {".sv": "timestamp"}})
-                await asyncio.sleep(3) # রেট লিমিট এড়াতে
+                ref.child(deal_id).set({"title": deal['title'], "sent": True})
+                await asyncio.sleep(2)
             except Exception as e:
-                logger.error(f"❌ মেসেজ সেন্ডিং এরর: {e}")
+                logger.error(f"Send error: {e}")
 
-# --- কমান্ডস ---
+    return new_found_count
+
+# --- কমান্ড হ্যান্ডলার ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 **প্লে-স্টোর অফার ট্র্যাকার এখন অনলাইন!**\nঅটোমেটিক আপডেট চ্যানেলে পাঠানো হবে।", parse_mode=ParseMode.MARKDOWN)
+    await update.message.reply_text("🤖 বট চালু আছে! আমি প্লে-স্টোর অফার খুঁজছি।")
 
 async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("🔍 অফার খোঁজা হচ্ছে, দয়া করে অপেক্ষা করুন...")
-    await auto_check_deals(context)
-    await update.message.reply_text("✅ চেক সম্পন্ন হয়েছে!")
+    await update.message.reply_text("🔍 স্ক্যান শুরু করছি...")
+    count = await auto_check_deals(context)
+    if count and count > 0:
+        await update.message.reply_text(f"✅ {count}টি নতুন অফার পাঠানো হয়েছে!")
+    else:
+        await update.message.reply_text("ℹ️ নতুন কোনো অফার পাওয়া যায়নি (সবগুলো আগেই পাঠানো হয়েছে)।")
 
 # --- মেইন রানার ---
 if __name__ == '__main__':
-    # ডিফল্ট পার্স মোড সেট করা যাতে বারবার লিখতে না হয়
     defaults = Defaults(parse_mode=ParseMode.MARKDOWN)
-    
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).defaults(defaults).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", manual_check))
 
-    # জব কিউ সেটআপ (প্রতি ৩০ মিনিটে একবার চেক করবে)
-    job_queue = app.job_queue
-    job_queue.run_repeating(auto_check_deals, interval=1800, first=5)
-
-    logger.info("🚀 বট সফলভাবে চালু হয়েছে...")
+    # জব কিউ সেটআপ
+    if app.job_queue:
+        app.job_queue.run_repeating(auto_check_deals, interval=1800, first=10)
+    
+    logger.info("🚀 বট রানিং...")
     app.run_polling()
