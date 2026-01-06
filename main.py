@@ -35,41 +35,41 @@ if not firebase_admin._apps:
     except Exception as e:
         logger.error(f"❌ ফায়ারবেস কানেকশন এরর: {e}")
 
-# --- স্ক্র্যাপিং লজিক ---
+# --- আরও শক্তিশালী স্ক্র্যাপিং লজিক ---
 async def fetch_all_deals():
     all_deals = []
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
 
     async with httpx.AsyncClient(headers=headers, timeout=30.0, follow_redirects=True) as client:
-        # সোর্স ১: Android Police
+        # সোর্স ১: Reddit r/googleplaydeals (সবচেয়ে নির্ভরযোগ্য)
+        try:
+            red_res = await client.get("https://www.reddit.com/r/googleplaydeals/new.json?limit=15")
+            if red_res.status_code == 200:
+                data = red_res.json()
+                for post in data['data']['children']:
+                    p = post['data']
+                    title = p['title']
+                    # কিওয়ার্ড ফিল্টার আরও উন্নত করা হয়েছে
+                    if any(kw in title.lower() for kw in ["free", "sale", "discount", "100%", "deal", "0.00"]):
+                        all_deals.append({
+                            "title": title, 
+                            "link": f"https://www.reddit.com{p['permalink']}", 
+                            "source": "Reddit"
+                        })
+        except Exception as e: logger.error(f"⚠️ Reddit Error: {e}")
+
+        # সোর্স ২: Android Police (উন্নত ডিটেকশন)
         try:
             ap_res = await client.get("https://www.androidpolice.com/tag/google-play-store-deals/")
             if ap_res.status_code == 200:
                 soup = BeautifulSoup(ap_res.text, 'html.parser')
-                articles = soup.find_all(['h2', 'div'], class_=re.compile(r'display-card|article-title|title'))
-                for item in articles:
-                    a_tag = item.find('a') if item.name != 'a' else item
-                    if a_tag and any(kw in a_tag.text.lower() for kw in ["free", "sale", "deal", "discount"]):
-                        title = a_tag.text.strip()
+                for a_tag in soup.find_all('a', href=True):
+                    txt = a_tag.text.lower()
+                    if len(txt) > 15 and any(kw in txt for kw in ["free", "sale", "deal", "discount", "price drop"]):
                         url = a_tag['href']
                         if not url.startswith('http'): url = "https://www.androidpolice.com" + url
-                        all_deals.append({"title": title, "link": url, "source": "Android Police"})
+                        all_deals.append({"title": a_tag.text.strip(), "link": url, "source": "Android Police"})
         except Exception as e: logger.error(f"⚠️ AP Error: {e}")
-
-        # সোর্স ২: OzBargain
-        try:
-            oz_res = await client.get("https://www.ozbargain.com.au/search/node/google%20play%20store%20free")
-            if oz_res.status_code == 200:
-                soup = BeautifulSoup(oz_res.text, 'html.parser')
-                for node in soup.find_all('h2', class_='title'):
-                    oz_a = node.find('a')
-                    if oz_a:
-                        all_deals.append({
-                            "title": oz_a.text.strip(),
-                            "link": "https://www.ozbargain.com.au" + oz_a['href'],
-                            "source": "OzBargain"
-                        })
-        except Exception as e: logger.error(f"⚠️ Oz Error: {e}")
 
     return all_deals
 
@@ -92,7 +92,8 @@ async def auto_check_deals(context: ContextTypes.DEFAULT_TYPE):
                 keyboard = [[InlineKeyboardButton("🎁 অফারটি দেখুন", url=deal['link'])]]
                 
                 message = (
-                    f"🔥 **নতুন অফার পাওয়া গেছে!** ({deal['source']})\n\n"
+                    f"🔥 **নতুন অফার পাওয়া গেছে!**\n"
+                    f"📡 **সোর্স:** `{deal['source']}`\n\n"
                     f"📱 **নাম:** `{deal['title']}`\n\n"
                     f"✅ দ্রুত চেক করুন, অফারটি সীমিত সময়ের জন্য!"
                 )
@@ -103,48 +104,36 @@ async def auto_check_deals(context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
                 ref.child(deal_id).set({"title": deal['title'], "sent": True})
-                await asyncio.sleep(3) # স্প্যাম প্রোটেকশন
+                await asyncio.sleep(3) # রেট লিমিট সুরক্ষা
         
         return new_found_count
     except Exception as e:
-        logger.error(f"❌ অটো-চেক জব এ ত্রুটি: {e}")
+        logger.error(f"❌ এরর: {e}")
         return 0
 
-# --- কমান্ড হ্যান্ডলার ---
+# --- কমান্ডস ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🤖 বট অনলাইন! আমি প্লে-স্টোর অফার খুঁজছি।")
+    await update.message.reply_text("🤖 বট অনলাইন! আমি অফার খুঁজছি।")
 
 async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID: return
-    await update.message.reply_text("🔍 স্ক্র্যান শুরু করছি, একটু সময় দিন...")
+    await update.message.reply_text("🔍 স্ক্যান শুরু করছি...")
     count = await auto_check_deals(context)
     if count > 0:
         await update.message.reply_text(f"✅ {count}টি নতুন অফার পাঠানো হয়েছে!")
     else:
-        await update.message.reply_text("ℹ️ নতুন কোনো অফার নেই অথবা সব আগে পাঠানো হয়েছে।")
-
-# --- এরর হ্যান্ডলার ---
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error(f"❌ আপডেট হ্যান্ডেল করার সময় এরর: {context.error}")
+        await update.message.reply_text("ℹ️ নতুন কোনো অফার নেই।")
 
 # --- মেইন রানার ---
 if __name__ == '__main__':
     defaults = Defaults(parse_mode=ParseMode.MARKDOWN)
-    
-    # অ্যাপ্লিকেশন বিল্ড
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).defaults(defaults).build()
 
-    # হ্যান্ডলার রেজিস্ট্রেশন
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("check", manual_check))
-    app.add_error_handler(error_handler)
 
-    # জব কিউ সেটআপ (প্রতি ৩০ মিনিটে একবার)
     if app.job_queue:
         app.job_queue.run_repeating(auto_check_deals, interval=1800, first=10)
-        logger.info("⏰ জব কিউ সক্রিয় করা হয়েছে।")
     
-    logger.info("🚀 বট পোলিং শুরু করছে...")
-    
-    # ৪০৯ কনফ্লিক্ট এড়াতে drop_pending_updates=True ব্যবহার করা হয়েছে
+    logger.info("🚀 বট রানিং...")
     app.run_polling(drop_pending_updates=True)
