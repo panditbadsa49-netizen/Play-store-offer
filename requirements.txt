@@ -3,3 +3,4 @@ firebase-admin
 httpx
 beautifulsoup4
 python-dotenv
+flask
