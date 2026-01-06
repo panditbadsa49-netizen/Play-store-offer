@@ -1,133 +1,171 @@
 import os
-import asyncio
 import json
+import logging
+import asyncio
 import requests
-from bs4 import BeautifulSoup
 import firebase_admin
 from firebase_admin import credentials, db
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, JobQueue
 
-# --- এনভায়রনমেন্ট ভেরিয়েবল ---
+# --- লগিং সেটআপ (কনসোলে এরর দেখার জন্য) ---
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- এনভায়রনমেন্ট ভেরিয়েবল লোড ---
+# আপনার .env ফাইল বা সিস্টেম ভেরিয়েবল থেকে এগুলো লোড হবে
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID"))  # আপনার নিজের টেলিগ্রাম আইডি (সংখ্যায়)
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 FIREBASE_DB_URL = os.getenv("FIREBASE_DB_URL")
-FIREBASE_JSON_KEY = os.getenv("FIREBASE_JSON_KEY")
-CHAT_ID = os.getenv("CHAT_ID") # যে চ্যানেল বা গ্রুপে অফার যাবে
+# চ্যাট আইডি (ইন্টিকেজার হিসেবে কনভার্ট করা ভালো)
+try:
+    CHAT_ID = int(os.getenv("CHAT_ID"))
+except ValueError:
+    CHAT_ID = os.getenv("CHAT_ID") # যদি পাবলিক চ্যানেল হয় (@channelname)
 
 # --- ফায়ারবেস ইনিশিয়ালাইজেশন ---
+# খেয়াল রাখবেন: FIREBASE_JSON_KEY এনভায়রনমেন্টে পুরো JSON টেক্সট থাকতে হবে
 if not firebase_admin._apps:
-    cred_dict = json.loads(FIREBASE_JSON_KEY)
-    cred = credentials.Certificate(cred_dict)
-    firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_DB_URL})
+    try:
+        firebase_json = os.getenv("FIREBASE_JSON_KEY")
+        cred_dict = json.loads(firebase_json)
+        cred = credentials.Certificate(cred_dict)
+        firebase_admin.initialize_app(cred, {'databaseURL': FIREBASE_DB_URL})
+        print("✅ ফায়ারবেস কানেক্টেড!")
+    except Exception as e:
+        logger.error(f"❌ ফায়ারবেস এরর: {e}")
 
-# --- স্ক্র্যাপিং লজিক ---
-def get_playstore_deals():
+# --- নতুন স্ক্র্যাপিং লজিক (Reddit API - অনেক বেশি স্টেবল) ---
+def get_reddit_deals():
+    """
+    Reddit এর r/googleplaydeals থেকে JSON ডেটা নিয়ে আসে।
+    এটি সাধারণ ওয়েব স্ক্র্যাপিংয়ের চেয়ে অনেক বেশি নির্ভরযোগ্য।
+    """
     deals = []
-    # এখানে আমরা AppSales বা একই ধরনের সাইট স্ক্র্যাপ করার লজিক রাখতে পারি
-    # আপাতত আমরা একটি স্যাম্পল সোর্স ব্যবহার করছি
-    url = "https://www.androidpolice.com/tag/google-play-store-deals/"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    url = "https://www.reddit.com/r/googleplaydeals/new.json?limit=10"
+    # Reddit এ রিকোয়েস্ট করার জন্য একটি ইউনিক User-Agent লাগে
+    headers = {"User-Agent": "MyPlayStoreBot/1.0"}
     
     try:
         response = requests.get(url, headers=headers)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        articles = soup.find_all('h2', limit=10)
-        for article in articles:
-            title = article.text.strip()
-            link = article.find('a')['href']
-            if any(x in title.lower() for x in ["free", "sale", "discount"]):
-                deals.append({"title": title, "link": link})
+        if response.status_code == 200:
+            data = response.json()
+            posts = data['data']['children']
+            
+            for post in posts:
+                post_data = post['data']
+                title = post_data['title']
+                url_link = post_data['url'] # অ্যাপের ডিরেক্ট লিংক
+                
+                # আমরা শুধু পেইড অ্যাপ ফ্রি বা ডিসকাউন্ট খুঁজবো
+                # সাধারণ আইকন প্যাক বা গেম ফিল্টার করতে চাইলে এখানে শর্ত দিতে পারেন
+                if "Free" in title or "Sale" in title or "100%" in title:
+                    deals.append({
+                        "title": title,
+                        "link": url_link,
+                        "id": post_data['id'] # ডুপ্লিকেট চেক করার জন্য ইউনিক আইডি
+                    })
+        else:
+            logger.error(f"Reddit API Error: {response.status_code}")
+            
     except Exception as e:
-        print(f"Scraping error: {e}")
+        logger.error(f"ডেটা ফেচিং এরর: {e}")
+        
     return deals
 
-# --- কমান্ড ফাংশনসমূহ ---
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """স্টার্ট কমান্ড"""
-    user_id = update.effective_user.id
-    welcome_text = "👋 স্বাগতম! আমি প্লে স্টোর অফার ট্র্যাকার বট।\n\nআমি অটোমেটিক আপনাকে পেইড অ্যাপের অফার জানাবো।"
-    
-    if user_id == ADMIN_ID:
-        welcome_text += "\n\n👑 **এডমিন প্যানেল আনলকড:**\n/check - এখনই নতুন অফার খুঁজুন\n/stats - ডেটাবেজ রিপোর্ট দেখুন"
-    
-    await update.message.reply_text(welcome_text)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """হেল্প কমান্ড"""
-    help_text = "বট ব্যবহারের নিয়মাবলী:\n1. বটটি প্রতি ১ ঘণ্টা পর পর অটো চেক করে।\n2. নতুন অফার পেলে ইনবক্সে/চ্যানেলে বাটনসহ মেসেজ যাবে।"
-    await update.message.reply_text(help_text)
-
-async def check_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ম্যানুয়ালি অফার চেক করা (শুধুমাত্র এডমিন)"""
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("❌ দুঃখিত, এই কমান্ডটি শুধুমাত্র এডমিনের জন্য।")
-        return
-
-    await update.message.reply_text("🔍 অফার খোঁজা হচ্ছে... দয়া করে অপেক্ষা করুন।")
-    await run_tracker(context.application)
-    await update.message.reply_text("✅ চেকিং শেষ হয়েছে।")
-
-async def get_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ডেটাবেজ স্ট্যাটাস (শুধুমাত্র এডমিন)"""
-    if update.effective_user.id != ADMIN_ID: return
-    
+# --- মেসেজ সেন্ডিং এবং ডেটাবেজ আপডেট ফাংশন ---
+async def process_deals(context: ContextTypes.DEFAULT_TYPE):
+    """অফার প্রসেস করে এবং চ্যানেলে পাঠায়"""
+    deals = get_reddit_deals()
     ref = db.reference('/sent_deals')
-    data = ref.get()
-    count = len(data) if data else 0
-    await update.message.reply_text(f"📊 এখন পর্যন্ত মোট {count}টি অফার পাঠানো হয়েছে।")
-
-# --- ট্র্যাকার লজিক ---
-
-async def run_tracker(application):
-    """অটোমেটিক অফার চেকিং লজিক"""
-    ref = db.reference('/sent_deals')
-    deals = get_playstore_deals()
+    
+    sent_count = 0
     
     for deal in deals:
-        deal_key = "".join(filter(str.isalnum, deal['title']))[:50]
-        if not ref.child(deal_key).get():
+        # ইউনিক কি (Key) তৈরি
+        deal_id = deal['id']
+        
+        # ফায়ারবেসে চেক করা যে এই আইডি আগে পাঠানো হয়েছে কিনা
+        if not ref.child(deal_id).get():
             # বাটন তৈরি
             keyboard = [[InlineKeyboardButton("📥 ডাউনলোড করুন", url=deal['link'])]]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            message = f"🎁 **প্রিমিয়াম অ্যাপ অফার!**\n\n📱 **নাম:** {deal['title']}\n\n💰 এটি এখন সীমিত সময়ের জন্য ফ্রি বা ডিসকাউন্টে পাওয়া যাচ্ছে।"
-            
-            # মেসেজ পাঠানো
-            await application.bot.send_message(
-                chat_id=CHAT_ID, 
-                text=message, 
-                parse_mode='Markdown',
-                reply_markup=reply_markup
+            # মেসেজ ফরম্যাটিং
+            msg_text = (
+                f"🔥 **নতুন অ্যাপ অফার!**\n\n"
+                f"📱 **অ্যাপ:** {deal['title']}\n\n"
+                f"⚡ এখনই ডাউনলোড করে নিন সময় শেষ হওয়ার আগে!"
             )
             
-            # ফায়ারবেসে সেভ করা
-            ref.child(deal_key).set({"sent": True})
-            await asyncio.sleep(2) # স্প্যামিং রোধে বিরতি
+            try:
+                await context.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=msg_text,
+                    parse_mode='Markdown',
+                    reply_markup=reply_markup
+                )
+                
+                # সফলভাবে পাঠানোর পর ডেটাবেজে সেভ করা
+                ref.child(deal_id).set({
+                    "title": deal['title'],
+                    "sent_at": str(asyncio.get_event_loop().time())
+                })
+                sent_count += 1
+                await asyncio.sleep(3) # টেলিগ্রামের লিমিট এড়াতে বিরতি
+                
+            except Exception as e:
+                logger.error(f"মেসেজ পাঠাতে সমস্যা: {e}")
+    
+    if sent_count > 0:
+        print(f"✅ মোট {sent_count}টি নতুন অফার পাঠানো হয়েছে।")
+    else:
+        print("💤 কোনো নতুন অফার পাওয়া যায়নি।")
 
-async def auto_check_loop(application):
-    """লুপ যা নির্দিষ্ট সময় পর পর রান করবে"""
-    while True:
-        await run_tracker(application)
-        await asyncio.sleep(3600) # প্রতি ১ ঘণ্টা পর পর
+# --- জব কিউ (অটোমেটিক টাস্ক) ---
+async def scheduled_check(context: ContextTypes.DEFAULT_TYPE):
+    """এই ফাংশনটি নির্দিষ্ট সময় পর পর রান হবে"""
+    print("⏳ অটো চেক শুরু হচ্ছে...")
+    await process_deals(context)
+
+# --- কমান্ড হ্যান্ডলার ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.message.reply_text(f"স্বাগতম {user.first_name}! আমি অফার চেকিং বট।")
+
+async def manual_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """এডমিন ম্যানুয়ালি চেক করতে চাইলে"""
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ আপনি এডমিন নন।")
+        return
+
+    await update.message.reply_text("🔍 ম্যানুয়াল চেকিং শুরু হচ্ছে...")
+    # সরাসরি প্রসেস ফাংশন কল করা
+    await process_deals(context)
+    await update.message.reply_text("✅ চেকিং সম্পন্ন।")
 
 # --- মেইন ফাংশন ---
-
 if __name__ == '__main__':
-    # অ্যাপ্লিকেশন তৈরি
+    # টোকেন চেক
+    if not TELEGRAM_TOKEN:
+        print("❌ Error: TELEGRAM_TOKEN পাওয়া যায়নি!")
+        exit()
+
+    print("🤖 বট চালু হচ্ছে...")
+    
+    # অ্যাপ্লিকেশন বিল্ডার (JobQueue সহ)
     application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     
-    # কমান্ড হ্যান্ডলার যোগ করা
+    # জব কিউ সেটআপ (প্রতি ১ ঘণ্টায় একবার চেক করবে - ৩৬০০ সেকেন্ড)
+    job_queue = application.job_queue
+    job_queue.run_repeating(scheduled_check, interval=3600, first=10)
+    
+    # হ্যান্ডলার যুক্ত করা
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("check", check_now))
-    application.add_handler(CommandHandler("stats", get_stats))
+    application.add_handler(CommandHandler("check", manual_check))
     
-    # লুপ শুরু করা
-    print("বট চলছে...")
-    loop = asyncio.get_event_loop()
-    loop.create_task(auto_check_loop(application))
-    
-    # বট স্টার্ট করা
+    # বট রান করা
     application.run_polling()
